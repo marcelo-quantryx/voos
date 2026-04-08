@@ -326,10 +326,10 @@ def display_results(results: list[dict], origin: str, destination: str, top_n: i
 # ── Prefect Flow ───────────────────────────────────────────────────────────────
 @flow(name="find-cheapest-flight", log_prints=True)
 def find_cheapest_flight(
-    origin: str,
-    destination: str,
-    start_date: str,
-    end_date: str,
+    origin: Optional[str] = None,
+    destination: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     adults: int = 1,
     currency: str = "EUR",
     non_stop: bool = False,
@@ -342,6 +342,17 @@ def find_cheapest_flight(
     """
     Prefect flow to find the cheapest flights over a date range.
     """
+    # Fetch core params from args or Prefect Variable defaults
+    resolved_origin      = origin      or Variable.get("flight_origin", None)
+    resolved_destination = destination or Variable.get("flight_destination", None)
+    resolved_start_date  = start_date  or Variable.get("flight_start_date", None)
+    resolved_end_date    = end_date    or Variable.get("flight_end_date", None)
+
+    if not all([resolved_origin, resolved_destination, resolved_start_date, resolved_end_date]):
+        msg = "Missing required search parameters (origin, destination, start_date, end_date). Provide them as flow arguments or set Prefect Variables."
+        console.print(f"[bold red]Error:[/bold red] {msg}")
+        raise ValueError(msg)
+
     # Fetch from args, env, or Prefect Variable
     resolved_client_id     = client_id     or os.environ.get("AMADEUS_CLIENT_ID")     or Variable.get("amadeus_client_id")
     resolved_client_secret = client_secret or os.environ.get("AMADEUS_CLIENT_SECRET") or Variable.get("amadeus_client_secret")
@@ -355,8 +366,8 @@ def find_cheapest_flight(
         raise ValueError(msg)
 
     try:
-        start = parse_date(start_date).date()
-        end   = parse_date(end_date).date()
+        start = parse_date(resolved_start_date).date()
+        end   = parse_date(resolved_end_date).date()
     except ValueError as e:
         console.print(f"[red]Invalid date:[/red] {e}")
         raise ValueError(f"Invalid date: {e}")
@@ -370,7 +381,7 @@ def find_cheapest_flight(
     days = [d.strftime("%Y-%m-%d") for d in date_range(start, end)]
 
     console.print(
-        f"\n[bold]Route:[/bold]   {origin.upper()} → {destination.upper()}\n"
+        f"\n[bold]Route:[/bold]   {resolved_origin.upper()} → {resolved_destination.upper()}\n"
         f"[bold]Range:[/bold]   {start} → {end}  ({len(days)} days)\n"
         f"[bold]Workers:[/bold] {workers} parallel threads  |  "
         f"[bold]Adults:[/bold] {adults}  |  "
@@ -413,8 +424,8 @@ def find_cheapest_flight(
                     dep_date     = dep,
                     client_id    = resolved_client_id,
                     client_secret= resolved_client_secret,
-                    origin       = origin,
-                    destination  = destination,
+                    origin       = resolved_origin,
+                    destination  = resolved_destination,
                     adults       = adults,
                     currency     = currency,
                     non_stop     = non_stop,
@@ -445,7 +456,7 @@ def find_cheapest_flight(
             f"(no flights on that day, or API error).[/yellow]\n"
         )
 
-    display_results(results, origin, destination, top_n=top)
+    display_results(results, resolved_origin, resolved_destination, top_n=top)
     console.print()
 
     if results and export_duckdb:
@@ -470,8 +481,8 @@ def find_cheapest_flight(
                 INSERT INTO flight_prices VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 datetime.now(),
-                origin,
-                destination,
+                resolved_origin,
+                resolved_destination,
                 parse_date(best["date"]).date(),
                 best.get("flight_number", ""),
                 best.get("airline_name", best.get("airline_code", "")),
@@ -520,6 +531,23 @@ Environment variables:
 
     if args.deploy:
         console.print("[bold cyan]Deploying to Prefect Cloud...[/bold cyan]")
+        
+        # Prepare parameters from CLI args (if any) to be defaults for deployment
+        deployment_params = {
+            "origin": args.origin,
+            "destination": args.destination,
+            "start_date": args.start_date,
+            "end_date": args.end_date,
+            "adults": args.adults,
+            "currency": args.currency,
+            "non_stop": args.non_stop,
+            "top": args.top,
+            "workers": args.workers,
+            "export_duckdb": args.export_duckdb,
+        }
+        # Filter out None values so the flow defaults or Variable resolution can take over
+        deployment_params = {k: v for k, v in deployment_params.items() if v is not None}
+
         find_cheapest_flight.from_source(
             source="https://github.com/marcelo-quantryx/voos.git",
             entrypoint="find_cheapest_flight.py:find_cheapest_flight"
@@ -527,6 +555,7 @@ Environment variables:
             name="amadeus-flight-search",
             work_pool_name="default",
             interval=timedelta(hours=1),
+            parameters=deployment_params,
             job_variables={
                 "pip_packages": ["duckdb", "requests", "python-dateutil", "rich", "prefect"]
             },
