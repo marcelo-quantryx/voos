@@ -15,8 +15,10 @@ Usage:
         --start-date 2026-06-01 \
         --end-date 2026-06-30
 
+    python find_cheapest_flight.py --deploy
+
 Dependencies:
-    pip install requests python-dateutil rich
+    pip install requests python-dateutil rich prefect
 
 NOTE on parallelism:
     These are network-bound requests, so we use ThreadPoolExecutor rather
@@ -35,6 +37,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, timedelta, datetime
 from typing import Optional
+
+from prefect import flow, task
+from prefect.variables import Variable
 
 import duckdb
 import requests
@@ -318,87 +323,70 @@ def display_results(results: list[dict], origin: str, destination: str, top_n: i
         )
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="Find the cheapest day to fly (parallel) using the Amadeus API.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python find_cheapest_flight.py --origin MAD --destination LHR \\
-      --start-date 2026-06-01 --end-date 2026-06-30
+# ── Prefect Flow ───────────────────────────────────────────────────────────────
+@flow(name="find-cheapest-flight")
+def find_cheapest_flight(
+    origin: str,
+    destination: str,
+    start_date: str,
+    end_date: str,
+    adults: int = 1,
+    currency: str = "EUR",
+    non_stop: bool = False,
+    top: int = 10,
+    workers: int = 5,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    export_duckdb: Optional[str] = None,
+):
+    """
+    Prefect flow to find the cheapest flights over a date range.
+    """
+    # Fetch from args, env, or Prefect Variable
+    resolved_client_id     = client_id     or os.environ.get("AMADEUS_CLIENT_ID")     or Variable.get("amadeus_client_id")
+    resolved_client_secret = client_secret or os.environ.get("AMADEUS_CLIENT_SECRET") or Variable.get("amadeus_client_secret")
 
-  python find_cheapest_flight.py --origin BCN --destination CDG \\
-      --start-date 2026-07-01 --end-date 2026-07-31 \\
-      --adults 2 --non-stop --workers 10
-
-Environment variables:
-  AMADEUS_CLIENT_ID
-  AMADEUS_CLIENT_SECRET
-        """,
-    )
-    parser.add_argument("--origin",        required=True)
-    parser.add_argument("--destination",   required=True)
-    parser.add_argument("--start-date",    required=True, help="YYYY-MM-DD")
-    parser.add_argument("--end-date",      required=True, help="YYYY-MM-DD")
-    parser.add_argument("--adults",        type=int,   default=1,    help="Passengers (default: 1)")
-    parser.add_argument("--currency",                  default="EUR")
-    parser.add_argument("--non-stop",      action="store_true")
-    parser.add_argument("--top",           type=int,   default=10,   help="Rows to display (default: 10)")
-    parser.add_argument("--workers",       type=int,   default=5,
-                        help="Parallel threads (default: 5). "
-                             "Stay ≤10 on the free tier to avoid rate-limit errors.")
-    parser.add_argument("--client-id",     help="Amadeus client ID")
-    parser.add_argument("--client-secret", help="Amadeus client secret")
-    parser.add_argument("--export-duckdb", help="Path to DuckDB file to record the best flight")
-
-    args = parser.parse_args()
-
-    client_id     = args.client_id     or os.environ.get("AMADEUS_CLIENT_ID")
-    client_secret = args.client_secret or os.environ.get("AMADEUS_CLIENT_SECRET")
-
-    if not client_id or not client_secret:
-        console.print(
-            "[bold red]Error:[/bold red] Amadeus credentials required.\n"
-            "  Set [cyan]AMADEUS_CLIENT_ID[/cyan] and [cyan]AMADEUS_CLIENT_SECRET[/cyan],\n"
-            "  or pass [cyan]--client-id[/cyan] / [cyan]--client-secret[/cyan].\n\n"
-            "  Free account → [link=https://developers.amadeus.com/]https://developers.amadeus.com/[/link]"
+    if not resolved_client_id or not resolved_client_secret:
+        msg = (
+            "Amadeus API credentials missing! Set workspace variables "
+            "AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET, or pass them as args."
         )
-        sys.exit(1)
+        console.print(f"[bold red]Error:[/bold red] {msg}")
+        raise ValueError(msg)
 
     try:
-        start = parse_date(args.start_date).date()
-        end   = parse_date(args.end_date).date()
+        start = parse_date(start_date).date()
+        end   = parse_date(end_date).date()
     except ValueError as e:
         console.print(f"[red]Invalid date:[/red] {e}")
-        sys.exit(1)
+        raise ValueError(f"Invalid date: {e}")
 
     if start > end:
-        console.print("[red]--start-date must be before --end-date[/red]")
-        sys.exit(1)
+        console.print("[red]start_date must be before end_date[/red]")
+        raise ValueError("start_date must be before end_date")
     if start < date.today():
-        console.print("[yellow]⚠  start-date is in the past — Amadeus may reject past dates.[/yellow]")
+        console.print("[yellow]⚠  start_date is in the past — Amadeus may reject past dates.[/yellow]")
 
     days = [d.strftime("%Y-%m-%d") for d in date_range(start, end)]
 
     console.print(
-        f"\n[bold]Route:[/bold]   {args.origin.upper()} → {args.destination.upper()}\n"
+        f"\n[bold]Route:[/bold]   {origin.upper()} → {destination.upper()}\n"
         f"[bold]Range:[/bold]   {start} → {end}  ({len(days)} days)\n"
-        f"[bold]Workers:[/bold] {args.workers} parallel threads  |  "
-        f"[bold]Adults:[/bold] {args.adults}  |  "
-        f"[bold]Currency:[/bold] {args.currency}  |  "
-        f"[bold]Non-stop:[/bold] {'yes' if args.non_stop else 'no'}\n"
+        f"[bold]Workers:[/bold] {workers} parallel threads  |  "
+        f"[bold]Adults:[/bold] {adults}  |  "
+        f"[bold]Currency:[/bold] {currency}  |  "
+        f"[bold]Non-stop:[/bold] {'yes' if non_stop else 'no'}\n"
     )
 
     # ── Warm up: verify credentials before spawning threads ──────────────────
     console.print("[bold]Authenticating...[/bold]")
     try:
-        warm = WorkerState(client_id=client_id, client_secret=client_secret)
+        warm = WorkerState(client_id=resolved_client_id, client_secret=resolved_client_secret)
         warm.ensure_token()
         console.print("[green]✓ Credentials valid[/green]\n")
     except requests.HTTPError as e:
         console.print(f"[red]Authentication failed:[/red] {e}")
-        sys.exit(1)
+        raise ValueError(f"Authentication failed: {e}")
 
     # ── Parallel search ───────────────────────────────────────────────────────
     results: list[dict] = []
@@ -413,23 +401,23 @@ Environment variables:
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task(
-            f"Searching with [cyan]{args.workers}[/cyan] workers...",
+        task_prog = progress.add_task(
+            f"Searching with [cyan]{workers}[/cyan] workers...",
             total=len(days),
         )
 
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
                     fetch_date,
                     dep_date     = dep,
-                    client_id    = client_id,
-                    client_secret= client_secret,
-                    origin       = args.origin,
-                    destination  = args.destination,
-                    adults       = args.adults,
-                    currency     = args.currency,
-                    non_stop     = args.non_stop,
+                    client_id    = resolved_client_id,
+                    client_secret= resolved_client_secret,
+                    origin       = origin,
+                    destination  = destination,
+                    adults       = adults,
+                    currency     = currency,
+                    non_stop     = non_stop,
                 ): dep
                 for dep in days
             }
@@ -448,7 +436,7 @@ Environment variables:
                         errors += 1
                     console.print(f"[yellow]  ⚠ {dep}: {exc}[/yellow]")
                 finally:
-                    progress.advance(task)
+                    progress.advance(task_prog)
 
     console.print()
     if errors:
@@ -457,15 +445,15 @@ Environment variables:
             f"(no flights on that day, or API error).[/yellow]\n"
         )
 
-    display_results(results, args.origin, args.destination, top_n=args.top)
+    display_results(results, origin, destination, top_n=top)
     console.print()
 
-    if results and args.export_duckdb:
+    if results and export_duckdb:
         sorted_r = sorted(results, key=lambda x: x["price"])
         best = sorted_r[0]
         
         try:
-            conn = duckdb.connect(args.export_duckdb)
+            conn = duckdb.connect(export_duckdb)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS flight_prices (
                     recorded_at TIMESTAMP,
@@ -482,8 +470,8 @@ Environment variables:
                 INSERT INTO flight_prices VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 datetime.now(),
-                args.origin,
-                args.destination,
+                origin,
+                destination,
                 parse_date(best["date"]).date(),
                 best.get("flight_number", ""),
                 best.get("airline_name", best.get("airline_code", "")),
@@ -491,9 +479,72 @@ Environment variables:
                 best["currency"]
             ))
             conn.close()
-            console.print(f"[green]✓ Best price exported to DuckDB: {args.export_duckdb}[/green]")
+            console.print(f"[green]✓ Best price exported to DuckDB: {export_duckdb}[/green]")
         except Exception as e:
             console.print(f"[red]Failed to export to DuckDB: {e}[/red]")
 
+
+# ── Main / CLI ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Find the cheapest day to fly (parallel) using the Amadeus API.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  python find_cheapest_flight.py --origin MAD --destination LHR \\
+      --start-date 2026-06-01 --end-date 2026-06-30
+
+  python find_cheapest_flight.py --deploy
+
+Environment variables:
+  AMADEUS_CLIENT_ID
+  AMADEUS_CLIENT_SECRET
+        """,
+    )
+    parser.add_argument("--origin",        required=False, help="Origin airport code")
+    parser.add_argument("--destination",   required=False, help="Destination airport code")
+    parser.add_argument("--start-date",    required=False, help="YYYY-MM-DD")
+    parser.add_argument("--end-date",      required=False, help="YYYY-MM-DD")
+    parser.add_argument("--adults",        type=int,   default=1,    help="Passengers (default: 1)")
+    parser.add_argument("--currency",                  default="EUR")
+    parser.add_argument("--non-stop",      action="store_true")
+    parser.add_argument("--top",           type=int,   default=10,   help="Rows to display (default: 10)")
+    parser.add_argument("--workers",       type=int,   default=5,
+                        help="Parallel threads (default: 5). Stay ≤10 on the free tier to avoid rate-limit errors.")
+    parser.add_argument("--client-id",     help="Amadeus client ID")
+    parser.add_argument("--client-secret", help="Amadeus client secret")
+    parser.add_argument("--export-duckdb", help="Path to DuckDB file to record the best flight")
+    parser.add_argument("--deploy",        action="store_true", help="Deploy the flow to Prefect Cloud using GitHub source")
+
+    args = parser.parse_args()
+
+    if args.deploy:
+        console.print("[bold cyan]Deploying to Prefect Cloud...[/bold cyan]")
+        find_cheapest_flight.from_source(
+            source="https://github.com/marcelo-quantryx/voos.git",
+            entrypoint="find_cheapest_flight.py:find_cheapest_flight"
+        ).deploy(
+            name="amadeus-flight-search",
+            work_pool_name="default",
+            interval=timedelta(hours=1),
+        )
+        console.print("[bold green]Deployment successful![/bold green]")
+    else:
+        if not all([args.origin, args.destination, args.start_date, args.end_date]):
+            console.print("[red]Error: --origin, --destination, --start-date, and --end-date are required when not deploying.[/red]")
+            sys.exit(1)
+            
+        find_cheapest_flight(
+            origin=args.origin,
+            destination=args.destination,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            adults=args.adults,
+            currency=args.currency,
+            non_stop=args.non_stop,
+            top=args.top,
+            workers=args.workers,
+            client_id=args.client_id,
+            client_secret=args.client_secret,
+            export_duckdb=args.export_duckdb,
+        )
