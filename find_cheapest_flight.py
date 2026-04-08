@@ -527,6 +527,9 @@ Environment variables:
             name="amadeus-flight-search",
             work_pool_name="default",
             interval=timedelta(hours=1),
+            job_variables={
+                "pip_packages": ["duckdb", "requests", "python-dateutil", "rich", "prefect"]
+            },
         )
         console.print("[bold green]Deployment successful![/bold green]")
     else:
