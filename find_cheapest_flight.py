@@ -40,6 +40,7 @@ from typing import Optional
 
 from prefect import flow, task
 from prefect.variables import Variable
+from prefect.artifacts import create_markdown_artifact
 
 import duckdb
 import requests
@@ -323,6 +324,48 @@ def display_results(results: list[dict], origin: str, destination: str, top_n: i
         )
 
 
+def format_results_markdown(results: list[dict], origin: str, destination: str, top_n: int = 10) -> str:
+    """Format the flight results into a Markdown table for Prefect Artifacts."""
+    if not results:
+        return "No results found."
+
+    sorted_r = sorted(results, key=lambda x: x["price"])
+    best = sorted_r[0]
+    
+    md = f"# ✈️ Flight Search: {origin.upper()} → {destination.upper()}\n\n"
+    md += f"**Cheapest available price:** {best['currency']} {best['price']:.2f} on {best['date']}\n\n"
+    
+    md += "| # | Date | Weekday | Price | Flight No. | Airline | Stops | Duration | Dep | Arr |\n"
+    md += "|---|------|---------|-------|------------|---------|-------|----------|-----|-----|\n"
+    
+    for i, r in enumerate(sorted_r[:top_n], 1):
+        d = parse_date(r["date"])
+        stops_str = "direct" if r["stops"] == 0 else f"{r['stops']} stop{'s' if r['stops'] > 1 else ''}"
+        duration = r.get("duration", "—").replace("PT", "").lower()
+        price_str = f"**{r['currency']} {r['price']:.2f}**" if i == 1 else f"{r['currency']} {r['price']:.2f}"
+        
+        md += (
+            f"| {i} | {r['date']} | {d.strftime('%A')} | {price_str} | "
+            f"`{r.get('flight_number', '—')}` | {r.get('airline_name', '—')} | "
+            f"{stops_str} | {duration} | {r.get('dep_time', '—')} | {r.get('arr_time', '—')} |\n"
+        )
+    
+    # Add Day-of-week stats
+    dow: dict[str, list[float]] = {}
+    for r in results:
+        dow.setdefault(parse_date(r["date"]).strftime("%A"), []).append(r["price"])
+    
+    if len(dow) > 1:
+        avg = {d: sum(p) / len(p) for d, p in dow.items()}
+        best_dow = min(avg, key=avg.__getitem__)
+        worst_dow = max(avg, key=avg.__getitem__)
+        curr = results[0]["currency"]
+        md += f"\n\n### 📅 Trends\n- **Cheapest day to fly:** {best_dow}s (avg {curr} {avg[best_dow]:.0f})\n"
+        md += f"- **Priciest day to fly:** {worst_dow}s (avg {curr} {avg[worst_dow]:.0f})\n"
+
+    return md
+
+
 # ── Prefect Flow ───────────────────────────────────────────────────────────────
 @flow(name="find-cheapest-flight", log_prints=True)
 def find_cheapest_flight(
@@ -457,6 +500,15 @@ def find_cheapest_flight(
         )
 
     display_results(results, resolved_origin, resolved_destination, top_n=top)
+    
+    # Generate and link Prefect Artifact
+    markdown_table = format_results_markdown(results, resolved_origin, resolved_destination, top_n=top)
+    create_markdown_artifact(
+        key="flight-search-results",
+        markdown=markdown_table,
+        description=f"Cheapest flights for {resolved_origin.upper()} to {resolved_destination.upper()}"
+    )
+    console.print(f"[green]✓ Prefect Artifact created: flight-search-results[/green]")
     console.print()
 
     if results and export_duckdb:
