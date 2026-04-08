@@ -1,0 +1,4 @@
+/dev.env
+/flight_monitor.log
+/monitor_flight.sh
+/prices.duckdb
