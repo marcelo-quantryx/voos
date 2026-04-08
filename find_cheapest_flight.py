@@ -324,7 +324,7 @@ def display_results(results: list[dict], origin: str, destination: str, top_n: i
 
 
 # ── Prefect Flow ───────────────────────────────────────────────────────────────
-@flow(name="find-cheapest-flight")
+@flow(name="find-cheapest-flight", log_prints=True)
 def find_cheapest_flight(
     origin: str,
     destination: str,
